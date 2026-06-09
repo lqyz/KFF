@@ -1,5 +1,5 @@
 import torch
-import timm
+import torch.nn as nn
 import argparse
 from pathlib import Path
 
@@ -64,15 +64,39 @@ class EnvironmentMatrixSwapper:
 
 
 def build_model(args, device):
-    if args.dataset == 'imagenet':
-        model = timm.create_model("vit_base_patch16_224", pretrained=True)
-    elif args.dataset == 'cifar10':
-        model = timm.create_model("vit_base_patch16_384", pretrained=True, num_classes=10)
+    if args.backend == 'torchvision':
+        import torchvision
+        if args.dataset == 'imagenet':
+            model = torchvision.models.vit_b_16(
+                weights=torchvision.models.ViT_B_16_Weights.IMAGENET1K_V1)
+        elif args.dataset == 'cifar10':
+            model = torchvision.models.VisionTransformer(
+                image_size=224, patch_size=16, num_layers=12, num_heads=12,
+                hidden_dim=768, mlp_dim=3072, num_classes=10)
+            state_dict = torchvision.models.vit_b_16(
+                weights=torchvision.models.ViT_B_16_Weights.IMAGENET1K_V1).state_dict()
+            del state_dict['heads.head.weight'], state_dict['heads.head.bias']
+            model.load_state_dict(state_dict, strict=False)
+    else:
+        import timm
+        if args.dataset == 'imagenet':
+            model = timm.create_model("vit_base_patch16_224", pretrained=args.pretrained)
+        elif args.dataset == 'cifar10':
+            model = timm.create_model("vit_base_patch16_384", pretrained=args.pretrained, num_classes=10)
     model = model.to(device)
     model.eval()
     for param in model.parameters():
         param.requires_grad = False
     return model
+
+
+def get_block(model, idx):
+    if hasattr(model, 'blocks'):
+        return model.blocks[idx]
+    elif hasattr(model, 'encoder') and hasattr(model.encoder, 'layers'):
+        return model.encoder.layers[idx]
+    else:
+        raise AttributeError("Cannot find transformer blocks in model")
 
 
 def load_paired_imagenetc(n_examples, severity, data_dir, corruption_a, corruption_b):
@@ -103,7 +127,7 @@ def load_paired_imagenetc(n_examples, severity, data_dir, corruption_a, corrupti
     return x_a[:n], y_a[:n], x_b[:n], y_b[:n]
 
 
-def load_paired_cifar10c(n_examples, severity, data_dir, corruption_a, corruption_b):
+def load_paired_cifar10c(n_examples, severity, data_dir, corruption_a, corruption_b, resize=384):
     x_a, y_a = load_cifar10c(n_examples, severity, data_dir,
                              corruptions=[corruption_a])
     x_b, y_b = load_cifar10c(n_examples, severity, data_dir,
@@ -112,8 +136,8 @@ def load_paired_cifar10c(n_examples, severity, data_dir, corruption_a, corruptio
     assert torch.equal(y_a, y_b), \
         "Label mismatch: CIFAR-10-C images not paired"
 
-    x_a = torch.nn.functional.interpolate(x_a, size=(384, 384), mode='bilinear', align_corners=False)
-    x_b = torch.nn.functional.interpolate(x_b, size=(384, 384), mode='bilinear', align_corners=False)
+    x_a = torch.nn.functional.interpolate(x_a, size=(resize, resize), mode='bilinear', align_corners=False)
+    x_b = torch.nn.functional.interpolate(x_b, size=(resize, resize), mode='bilinear', align_corners=False)
     mean = torch.tensor([0.5, 0.5, 0.5]).view(1, 3, 1, 1)
     std = torch.tensor([0.5, 0.5, 0.5]).view(1, 3, 1, 1)
     x_a = (x_a - mean) / std
@@ -127,9 +151,10 @@ def load_data(args):
             args.n_examples, args.severity, args.data_dir,
             args.corruption_a, args.corruption_b)
     elif args.dataset == 'cifar10':
+        resize = 224 if args.backend == 'torchvision' else 384
         x_a, y_a, x_b, y_b = load_paired_cifar10c(
             args.n_examples, args.severity, args.data_dir,
-            args.corruption_a, args.corruption_b)
+            args.corruption_a, args.corruption_b, resize=resize)
     n = min(x_a.shape[0], args.n_examples)
     x_a, y_a = x_a[:n], y_a[:n]
     x_b, y_b = x_b[:n], y_b[:n]
@@ -153,13 +178,8 @@ def extract_domain_stats(model, x, layer, batch_size, device, cls_only):
     batched_forward(model, x, batch_size, device)
     mu, sigma = collector.compute_stats()
     handle.remove()
-    try:
-        n_tokens = 1 if cls_only else (model.patch_embed.num_patches + 1)
-    except AttributeError:
-        n_tokens = '?'
-    n_elements = x.shape[0] * n_tokens if isinstance(n_tokens, int) else '?'
-    print(f"      Accumulated {n_elements} feature vectors from {x.shape[0]} images"
-          f" (CLS-only={cls_only})")
+    n_tokens_info = 'CLS-only' if cls_only else 'all tokens'
+    print(f"      Accumulated features from {x.shape[0]} images ({n_tokens_info})")
     return mu.to(device), sigma.to(device)
 
 
@@ -211,7 +231,7 @@ def run_swap_experiment(args):
     x_a, y_a, x_b, y_b = load_data(args)
 
     layers = args.scan_layers if args.scan_layers else [args.hook_layer]
-    n_layers = len(model.blocks)
+    n_layers = len(model.encoder.layers) if hasattr(model, 'encoder') else len(model.blocks)
     layers = [l for l in layers if 0 <= l < n_layers]
     if not layers:
         raise ValueError(f"No valid layers in range [0, {n_layers - 1}]")
@@ -219,14 +239,14 @@ def run_swap_experiment(args):
     header = f"\n{'='*75}"
     print(header)
     print(f" Environment Matrix Swap Validation")
-    print(f" Dataset: {args.dataset} | Severity: {args.severity}")
+    print(f" Dataset: {args.dataset} | Severity: {args.severity} | Backend: {args.backend}")
     print(f" Env A: {args.corruption_a}  |  Env B: {args.corruption_b}")
     print(f" Samples: {x_a.shape[0]} | Batch: {args.batch_size} |"
           f" Stats: {'CLS-only' if not args.all_tokens else 'all tokens'}")
     if args.scan_layers:
         print(f" Scanning layers: {layers} (of {n_layers} blocks)")
     else:
-        print(f" Hook layer: blocks[{args.hook_layer}]")
+        print(f" Hook layer: block[{args.hook_layer}]")
     print(header)
 
     if args.clean_ref:
@@ -238,7 +258,8 @@ def run_swap_experiment(args):
         x_clean = x_clean[:min(x_clean.shape[0], args.n_examples)]
         y_clean = y_clean[:min(y_clean.shape[0], args.n_examples)]
         if args.dataset == 'cifar10':
-            x_clean = torch.nn.functional.interpolate(x_clean, size=(384, 384), mode='bilinear', align_corners=False)
+            resize = 224 if args.backend == 'torchvision' else 384
+            x_clean = torch.nn.functional.interpolate(x_clean, size=(resize, resize), mode='bilinear', align_corners=False)
             mean = torch.tensor([0.5, 0.5, 0.5]).view(1, 3, 1, 1)
             std = torch.tensor([0.5, 0.5, 0.5]).view(1, 3, 1, 1)
             x_clean = (x_clean - mean) / std
@@ -249,7 +270,7 @@ def run_swap_experiment(args):
 
     results = {}
     for layer_idx in layers:
-        layer = model.blocks[layer_idx]
+        layer = get_block(model, layer_idx)
         label = f"block[{layer_idx}]"
         print(f"\n{'─'*50}")
         print(f"  Layer: {label}")
@@ -296,5 +317,12 @@ if __name__ == '__main__':
                         help='Use all tokens for stats (default: CLS only, matching paper)')
     parser.add_argument('--clean_ref', action='store_true',
                         help='Include clean (uncorrupted) reference accuracy')
+    parser.add_argument('--backend', type=str, default='torchvision',
+                        choices=['torchvision', 'timm'],
+                        help='Model backend (torchvision downloads from PyTorch CDN)')
+    parser.add_argument('--pretrained', action='store_true', default=True,
+                        help='Use pretrained weights (timm backend only)')
+    parser.add_argument('--no_pretrained', action='store_false', dest='pretrained',
+                        help='Skip pretrained weights')
     args = parser.parse_args()
     run_swap_experiment(args)
