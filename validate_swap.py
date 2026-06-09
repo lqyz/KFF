@@ -7,29 +7,59 @@ from robustbench.data import load_cifar10c, PREPROCESSINGS
 from robustbench.loaders import CustomImageFolder
 
 
-class EnvironmentMatrixSwapper:
-    def __init__(self):
-        self.mode = 'passthrough'
-        self.mu_A = None
-        self.sigma_A = None
-        self.mu_B = None
-        self.sigma_B = None
+class FeatureCollector:
+    def __init__(self, cls_only=True):
+        self.features = []
+        self.cls_only = cls_only
 
     def hook_fn(self, module, input, output):
-        if self.mode == 'extract_A':
-            self.mu_A = output.mean(dim=(0, 1), keepdim=True)
-            self.sigma_A = output.std(dim=(0, 1), keepdim=True)
+        if self.cls_only:
+            self.features.append(output[:, 0:1].detach().cpu())
+        else:
+            self.features.append(output.detach().cpu())
+        return output
+
+    def compute_stats(self):
+        all_f = torch.cat(self.features, dim=0)
+        mu = all_f.mean(dim=(0, 1), keepdim=True)
+        sigma = all_f.std(dim=(0, 1), keepdim=True)
+        return mu, sigma
+
+    def reset(self):
+        self.features = []
+
+
+class EnvironmentMatrixSwapper:
+    def __init__(self, cls_only=True):
+        self.mode = 'passthrough'
+        self.mu_src = None
+        self.sigma_src = None
+        self.cls_only = cls_only
+
+    def set_target(self, mu, sigma):
+        self.mu_src = mu
+        self.sigma_src = sigma
+
+    def hook_fn(self, module, input, output):
+        if self.mode == 'passthrough':
             return output
-        elif self.mode == 'extract_B':
-            self.mu_B = output.mean(dim=(0, 1), keepdim=True)
-            self.sigma_B = output.std(dim=(0, 1), keepdim=True)
-            return output
-        elif self.mode == 'swap_A_to_B':
-            current_mu = output.mean(dim=(0, 1), keepdim=True)
-            current_sigma = output.std(dim=(0, 1), keepdim=True)
-            normalized_content = (output - current_mu) / (current_sigma + 1e-6)
-            swapped_output = normalized_content * self.sigma_B + self.mu_B
-            return swapped_output
+
+        if self.mode == 'swap':
+            assert self.mu_src is not None, "Target stats not set"
+            if self.cls_only:
+                f = output[:, 0:1]
+                current_mu = f.mean(dim=(0, 1), keepdim=True)
+                current_sigma = f.std(dim=(0, 1), keepdim=True)
+                normalized = (f - current_mu) / (current_sigma + 1e-6)
+                f_swapped = normalized * self.sigma_src + self.mu_src
+                output = output.clone()
+                output[:, 0:1] = f_swapped
+                return output
+            else:
+                current_mu = output.mean(dim=(0, 1), keepdim=True)
+                current_sigma = output.std(dim=(0, 1), keepdim=True)
+                normalized = (output - current_mu) / (current_sigma + 1e-6)
+                return normalized * self.sigma_src + self.mu_src
         return output
 
 
@@ -62,12 +92,12 @@ def load_paired_imagenetc(n_examples, severity, data_dir, corruption_a, corrupti
     x_b, y_b, paths_b = next(iter(loader_b))
 
     assert torch.equal(y_a[:n], y_b[:n]), \
-        f"Label mismatch: images are not paired between '{corruption_a}' and '{corruption_b}'"
+        f"Label mismatch: images not paired between '{corruption_a}' and '{corruption_b}'"
 
     rel_a = [str(Path(p).relative_to(path_a)) for p in paths_a[:n]]
     rel_b = [str(Path(p).relative_to(path_b)) for p in paths_b[:n]]
     assert rel_a == rel_b, \
-        f"Filename mismatch: images are not paired between '{corruption_a}' and '{corruption_b}'"
+        f"Filename mismatch: images not paired between '{corruption_a}' and '{corruption_b}'"
 
     print(f"[*] Paired loading verified: {n} images, labels + filenames match")
     return x_a[:n], y_a[:n], x_b[:n], y_b[:n]
@@ -80,7 +110,7 @@ def load_paired_cifar10c(n_examples, severity, data_dir, corruption_a, corruptio
                              corruptions=[corruption_b])
 
     assert torch.equal(y_a, y_b), \
-        f"Label mismatch: CIFAR-10-C images are not paired"
+        "Label mismatch: CIFAR-10-C images not paired"
 
     x_a = torch.nn.functional.interpolate(x_a, size=(384, 384), mode='bilinear', align_corners=False)
     x_b = torch.nn.functional.interpolate(x_b, size=(384, 384), mode='bilinear', align_corners=False)
@@ -116,6 +146,63 @@ def batched_forward(model, x, batch_size, device):
     return torch.cat(outputs, dim=0)
 
 
+@torch.no_grad()
+def extract_domain_stats(model, x, layer, batch_size, device, cls_only):
+    collector = FeatureCollector(cls_only=cls_only)
+    handle = layer.register_forward_hook(collector.hook_fn)
+    batched_forward(model, x, batch_size, device)
+    mu, sigma = collector.compute_stats()
+    handle.remove()
+    try:
+        n_tokens = 1 if cls_only else (model.patch_embed.num_patches + 1)
+    except AttributeError:
+        n_tokens = '?'
+    n_elements = x.shape[0] * n_tokens if isinstance(n_tokens, int) else '?'
+    print(f"      Accumulated {n_elements} feature vectors from {x.shape[0]} images"
+          f" (CLS-only={cls_only})")
+    return mu.to(device), sigma.to(device)
+
+
+def run_swap_for_layer(model, layer, x_a, y_a, x_b, y_b, args, device):
+    cls_only = not args.all_tokens
+
+    print(f"\n  [Extracting domain statistics]")
+    mu_A, sigma_A = extract_domain_stats(model, x_a, layer, args.batch_size, device, cls_only)
+    mu_B, sigma_B = extract_domain_stats(model, x_b, layer, args.batch_size, device, cls_only)
+
+    swapper = EnvironmentMatrixSwapper(cls_only=cls_only)
+    handle = layer.register_forward_hook(swapper.hook_fn)
+
+    swapper.mode = 'passthrough'
+    out_a = batched_forward(model, x_a, args.batch_size, device)
+    pred_a = out_a.argmax(dim=1).cpu()
+    acc_a = (pred_a == y_a).float().mean().item()
+
+    out_b = batched_forward(model, x_b, args.batch_size, device)
+    pred_b = out_b.argmax(dim=1).cpu()
+    acc_b = (pred_b == y_b).float().mean().item()
+
+    swapper.mode = 'swap'
+    swapper.set_target(mu_B, sigma_B)
+    out_a2b = batched_forward(model, x_a, args.batch_size, device)
+    pred_a2b = out_a2b.argmax(dim=1).cpu()
+    acc_a2b = (pred_a2b == y_a).float().mean().item()
+    cons_a2b = (pred_a == pred_a2b).float().mean().item()
+
+    swapper.set_target(mu_A, sigma_A)
+    out_b2a = batched_forward(model, x_b, args.batch_size, device)
+    pred_b2a = out_b2a.argmax(dim=1).cpu()
+    acc_b2a = (pred_b2a == y_b).float().mean().item()
+    cons_b2a = (pred_b == pred_b2a).float().mean().item()
+
+    handle.remove()
+    return {
+        'acc_a': acc_a, 'acc_b': acc_b,
+        'acc_a2b': acc_a2b, 'acc_b2a': acc_b2a,
+        'cons_a2b': cons_a2b, 'cons_b2a': cons_b2a,
+    }
+
+
 def run_swap_experiment(args):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"[*] Device: {device}")
@@ -123,51 +210,73 @@ def run_swap_experiment(args):
     model = build_model(args, device)
     x_a, y_a, x_b, y_b = load_data(args)
 
-    swapper = EnvironmentMatrixSwapper()
-    hook_layer = model.blocks[args.hook_layer]
-    hook_handle = hook_layer.register_forward_hook(swapper.hook_fn)
+    layers = args.scan_layers if args.scan_layers else [args.hook_layer]
+    n_layers = len(model.blocks)
+    layers = [l for l in layers if 0 <= l < n_layers]
+    if not layers:
+        raise ValueError(f"No valid layers in range [0, {n_layers - 1}]")
 
-    print(f"\n{'='*60}")
+    header = f"\n{'='*75}"
+    print(header)
     print(f" Environment Matrix Swap Validation")
     print(f" Dataset: {args.dataset} | Severity: {args.severity}")
-    print(f" Env A (corruption): {args.corruption_a}")
-    print(f" Env B (corruption): {args.corruption_b}")
-    print(f" Hook: blocks[{args.hook_layer}] | Samples: {x_a.shape[0]}")
-    print(f"{'='*60}")
+    print(f" Env A: {args.corruption_a}  |  Env B: {args.corruption_b}")
+    print(f" Samples: {x_a.shape[0]} | Batch: {args.batch_size} |"
+          f" Stats: {'CLS-only' if not args.all_tokens else 'all tokens'}")
+    if args.scan_layers:
+        print(f" Scanning layers: {layers} (of {n_layers} blocks)")
+    else:
+        print(f" Hook layer: blocks[{args.hook_layer}]")
+    print(header)
 
-    bs = args.batch_size
-    extract_bs = min(bs, x_a.shape[0])
+    if args.clean_ref:
+        from robustbench.data import load_clean_dataset
+        from robustbench.model_zoo.enums import BenchmarkDataset
+        ds_enum = BenchmarkDataset.imagenet if args.dataset == 'imagenet' else BenchmarkDataset.cifar_10
+        prepr = 'Res256Crop224' if args.dataset == 'imagenet' else 'none'
+        x_clean, y_clean = load_clean_dataset(ds_enum, args.n_examples, args.data_dir, prepr)
+        x_clean = x_clean[:min(x_clean.shape[0], args.n_examples)]
+        y_clean = y_clean[:min(y_clean.shape[0], args.n_examples)]
+        if args.dataset == 'cifar10':
+            x_clean = torch.nn.functional.interpolate(x_clean, size=(384, 384), mode='bilinear', align_corners=False)
+            mean = torch.tensor([0.5, 0.5, 0.5]).view(1, 3, 1, 1)
+            std = torch.tensor([0.5, 0.5, 0.5]).view(1, 3, 1, 1)
+            x_clean = (x_clean - mean) / std
+        out_clean = batched_forward(model, x_clean, args.batch_size, device)
+        pred_clean = out_clean.argmax(dim=1).cpu()
+        acc_clean = (pred_clean == y_clean).float().mean().item()
+        print(f"\n  [Clean reference] accuracy: {acc_clean:.2%}")
 
-    # Phase 1: Extract environment matrix A from a single batch
-    swapper.mode = 'extract_A'
-    _ = model(x_a[:extract_bs].to(device))
-    print(f"\n[Phase 1] Extracted env A stats (mu shape: {swapper.mu_A.shape})")
+    results = {}
+    for layer_idx in layers:
+        layer = model.blocks[layer_idx]
+        label = f"block[{layer_idx}]"
+        print(f"\n{'─'*50}")
+        print(f"  Layer: {label}")
+        print(f"{'─'*50}")
+        r = run_swap_for_layer(model, layer, x_a, y_a, x_b, y_b, args, device)
+        results[label] = r
 
-    # Phase 2: Extract environment matrix B from a single batch
-    swapper.mode = 'extract_B'
-    _ = model(x_b[:extract_bs].to(device))
-    print(f"[Phase 2] Extracted env B stats (mu shape: {swapper.mu_B.shape})")
+    print(f"\n{'='*75}")
+    print(f" Results Summary")
+    print(f"{'='*75}")
+    print(f" {'Layer':<14} {'Acc_A':>8} {'Acc_B':>8} {'A→B':>8} {'B→A':>8}"
+          f" {'Cons_A→B':>10} {'Cons_B→A':>10} {'ΔAcc_avg':>10}")
+    print(f" {'─'*14} {'─'*8} {'─'*8} {'─'*8} {'─'*8}"
+          f" {'─'*10} {'─'*10} {'─'*10}")
+    for label, r in results.items():
+        delta = ((r['acc_a'] - r['acc_a2b']) + (r['acc_b'] - r['acc_b2a'])) / 2
+        print(f" {label:<14} {r['acc_a']:7.2%} {r['acc_b']:7.2%} {r['acc_a2b']:7.2%} {r['acc_b2a']:7.2%}"
+              f" {r['cons_a2b']:9.2%} {r['cons_b2a']:9.2%} {delta:+9.2%}")
+    print(f"{'='*75}")
 
-    # Phase 3: Baseline accuracy on env A (passthrough mode)
-    swapper.mode = 'passthrough'
-    out_a = batched_forward(model, x_a, bs, device)
-    pred_a = out_a.argmax(dim=1).cpu()
-    acc_a = (pred_a == y_a).float().mean().item()
-    print(f"[Phase 3] Env A ({args.corruption_a}) baseline accuracy: {acc_a:.2%}")
-
-    # Phase 4: Swap intervention — inject env B's statistics into A's images
-    swapper.mode = 'swap_A_to_B'
-    out_swap = batched_forward(model, x_a, bs, device)
-    pred_swap = out_swap.argmax(dim=1).cpu()
-    acc_swap = (pred_swap == y_a).float().mean().item()
-    consistency = (pred_a == pred_swap).float().mean().item()
-
-    print(f"\n[Phase 4] After injecting env B matrix into env A images:")
-    print(f"          Accuracy: {acc_swap:.2%} (baseline: {acc_a:.2%})")
-    print(f"          Prediction consistency (A vs A->B swap): {consistency:.2%}")
-    print(f"{'='*60}")
-
-    hook_handle.remove()
+    if args.clean_ref:
+        print(f" Clean accuracy: {acc_clean:.2%}")
+        for label, r in results.items():
+            ratio_a2b = r['acc_a2b'] / acc_clean if acc_clean > 0 else 0
+            ratio_b2a = r['acc_b2a'] / acc_clean if acc_clean > 0 else 0
+            print(f" {label}: A→B retains {ratio_a2b:.1%} of clean acc,"
+                  f" B→A retains {ratio_b2a:.1%}")
 
 
 if __name__ == '__main__':
@@ -180,7 +289,12 @@ if __name__ == '__main__':
     parser.add_argument('--severity', type=int, default=5)
     parser.add_argument('--n_examples', type=int, default=1000)
     parser.add_argument('--batch_size', type=int, default=32)
-    parser.add_argument('--hook_layer', type=int, default=1,
-                        help='ViT block index to hook (0-based)')
+    parser.add_argument('--hook_layer', type=int, default=1)
+    parser.add_argument('--scan_layers', type=int, nargs='+', default=None,
+                        help='Scan multiple layers, e.g. --scan_layers 0 1 3 5 7 9 11')
+    parser.add_argument('--all_tokens', action='store_true',
+                        help='Use all tokens for stats (default: CLS only, matching paper)')
+    parser.add_argument('--clean_ref', action='store_true',
+                        help='Include clean (uncorrupted) reference accuracy')
     args = parser.parse_args()
     run_swap_experiment(args)
