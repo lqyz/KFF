@@ -1,10 +1,10 @@
 import torch
-import torch.nn as nn
 import timm
 import argparse
-import math
+from pathlib import Path
 
-from robustbench.data import load_imagenetc, load_cifar10c
+from robustbench.data import load_cifar10c, PREPROCESSINGS
+from robustbench.loaders import CustomImageFolder
 
 
 class EnvironmentMatrixSwapper:
@@ -45,23 +45,61 @@ def build_model(args, device):
     return model
 
 
+def load_paired_imagenetc(n_examples, severity, data_dir, corruption_a, corruption_b):
+    transform = PREPROCESSINGS['Res256Crop224']
+
+    path_a = Path(data_dir) / corruption_a / str(severity)
+    path_b = Path(data_dir) / corruption_b / str(severity)
+
+    dataset_a = CustomImageFolder(str(path_a), transform)
+    dataset_b = CustomImageFolder(str(path_b), transform)
+
+    n = min(n_examples, len(dataset_a))
+    loader_a = torch.utils.data.DataLoader(dataset_a, batch_size=n, shuffle=False)
+    loader_b = torch.utils.data.DataLoader(dataset_b, batch_size=n, shuffle=False)
+
+    x_a, y_a, paths_a = next(iter(loader_a))
+    x_b, y_b, paths_b = next(iter(loader_b))
+
+    assert torch.equal(y_a[:n], y_b[:n]), \
+        f"Label mismatch: images are not paired between '{corruption_a}' and '{corruption_b}'"
+
+    rel_a = [str(Path(p).relative_to(path_a)) for p in paths_a[:n]]
+    rel_b = [str(Path(p).relative_to(path_b)) for p in paths_b[:n]]
+    assert rel_a == rel_b, \
+        f"Filename mismatch: images are not paired between '{corruption_a}' and '{corruption_b}'"
+
+    print(f"[*] Paired loading verified: {n} images, labels + filenames match")
+    return x_a[:n], y_a[:n], x_b[:n], y_b[:n]
+
+
+def load_paired_cifar10c(n_examples, severity, data_dir, corruption_a, corruption_b):
+    x_a, y_a = load_cifar10c(n_examples, severity, data_dir,
+                             corruptions=[corruption_a])
+    x_b, y_b = load_cifar10c(n_examples, severity, data_dir,
+                             corruptions=[corruption_b])
+
+    assert torch.equal(y_a, y_b), \
+        f"Label mismatch: CIFAR-10-C images are not paired"
+
+    x_a = torch.nn.functional.interpolate(x_a, size=(384, 384), mode='bilinear', align_corners=False)
+    x_b = torch.nn.functional.interpolate(x_b, size=(384, 384), mode='bilinear', align_corners=False)
+    mean = torch.tensor([0.5, 0.5, 0.5]).view(1, 3, 1, 1)
+    std = torch.tensor([0.5, 0.5, 0.5]).view(1, 3, 1, 1)
+    x_a = (x_a - mean) / std
+    x_b = (x_b - mean) / std
+    return x_a, y_a, x_b, y_b
+
+
 def load_data(args):
     if args.dataset == 'imagenet':
-        x_a, y_a = load_imagenetc(args.n_examples, args.severity, args.data_dir,
-                                  corruptions=[args.corruption_a])
-        x_b, y_b = load_imagenetc(args.n_examples, args.severity, args.data_dir,
-                                  corruptions=[args.corruption_b])
+        x_a, y_a, x_b, y_b = load_paired_imagenetc(
+            args.n_examples, args.severity, args.data_dir,
+            args.corruption_a, args.corruption_b)
     elif args.dataset == 'cifar10':
-        x_a, y_a = load_cifar10c(args.n_examples, args.severity, args.data_dir,
-                                 corruptions=[args.corruption_a])
-        x_b, y_b = load_cifar10c(args.n_examples, args.severity, args.data_dir,
-                                 corruptions=[args.corruption_b])
-        x_a = torch.nn.functional.interpolate(x_a, size=(384, 384), mode='bilinear', align_corners=False)
-        x_b = torch.nn.functional.interpolate(x_b, size=(384, 384), mode='bilinear', align_corners=False)
-        mean = torch.tensor([0.5, 0.5, 0.5]).view(1, 3, 1, 1)
-        std = torch.tensor([0.5, 0.5, 0.5]).view(1, 3, 1, 1)
-        x_a = (x_a - mean) / std
-        x_b = (x_b - mean) / std
+        x_a, y_a, x_b, y_b = load_paired_cifar10c(
+            args.n_examples, args.severity, args.data_dir,
+            args.corruption_a, args.corruption_b)
     n = min(x_a.shape[0], args.n_examples)
     x_a, y_a = x_a[:n], y_a[:n]
     x_b, y_b = x_b[:n], y_b[:n]
