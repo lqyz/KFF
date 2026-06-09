@@ -123,6 +123,11 @@ def load_paired_imagenetc(n_examples, severity, data_dir, corruption_a, corrupti
     assert rel_a == rel_b, \
         f"Filename mismatch: images not paired between '{corruption_a}' and '{corruption_b}'"
 
+    mean = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1)
+    std = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1)
+    x_a = (x_a - mean) / std
+    x_b = (x_b - mean) / std
+
     print(f"[*] Paired loading verified: {n} images, labels + filenames match")
     return x_a[:n], y_a[:n], x_b[:n], y_b[:n]
 
@@ -257,6 +262,10 @@ def run_swap_experiment(args):
         x_clean, y_clean = load_clean_dataset(ds_enum, args.n_examples, args.data_dir, prepr)
         x_clean = x_clean[:min(x_clean.shape[0], args.n_examples)]
         y_clean = y_clean[:min(y_clean.shape[0], args.n_examples)]
+        if args.dataset == 'imagenet':
+            mean = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1)
+            std = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1)
+            x_clean = (x_clean - mean) / std
         if args.dataset == 'cifar10':
             resize = 224 if args.backend == 'torchvision' else 384
             x_clean = torch.nn.functional.interpolate(x_clean, size=(resize, resize), mode='bilinear', align_corners=False)
