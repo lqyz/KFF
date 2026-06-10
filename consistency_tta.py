@@ -128,12 +128,16 @@ def run_consistency_experiment(args):
     else:
         raise RuntimeError("Cannot find classification head to unfreeze")
 
+    head_initial = {k: v.clone() for k, v in head.state_dict().items()}
+
     layer = get_block(model, args.hook_layer)
 
     for beta in args.betas:
+        head.load_state_dict(head_initial)
         print(f"\n{'='*60}")
         print(f" beta = {beta} | layer = block[{args.hook_layer}] |"
-              f" blend = {args.alpha_blend} | bank = {args.bank_size}")
+              f" blend = {args.alpha_blend} | bank = {args.bank_size} |"
+              f" steps = {args.inner_steps}")
         print(f"{'='*60}")
 
         tta = ConsistencyTTA(
@@ -152,11 +156,12 @@ def run_consistency_experiment(args):
             end = min(i + bs, n_samples)
             x_batch = x_a[i:end].to(device)
 
-            info = tta.adapt_step(
-                x_batch,
-                base_loss_fn=lambda logits: softmax_entropy(logits).mean(0),
-            )
-            losses_log.append(info)
+            for _ in range(args.inner_steps):
+                info = tta.adapt_step(
+                    x_batch,
+                    base_loss_fn=lambda logits: softmax_entropy(logits).mean(0),
+                )
+                losses_log.append(info)
 
             with torch.no_grad():
                 self_out = model(x_batch)
@@ -193,12 +198,14 @@ if __name__ == '__main__':
     parser.add_argument('--severity', type=int, default=5)
     parser.add_argument('--n_examples', type=int, default=500)
     parser.add_argument('--batch_size', type=int, default=32)
-    parser.add_argument('--hook_layer', type=int, default=1)
+    parser.add_argument('--hook_layer', type=int, default=5)
     parser.add_argument('--betas', type=float, nargs='+',
                         default=[0.0, 0.1, 0.5, 1.0, 2.0, 5.0])
     parser.add_argument('--alpha_blend', type=float, default=0.5)
     parser.add_argument('--bank_size', type=int, default=20)
     parser.add_argument('--lr', type=float, default=0.001)
+    parser.add_argument('--inner_steps', type=int, default=1,
+                        help='Adaptation steps per batch')
     parser.add_argument('--all_tokens', action='store_true')
     parser.add_argument('--backend', type=str, default='torchvision',
                         choices=['torchvision', 'timm'])
