@@ -38,6 +38,19 @@ class ConsistencyTTA:
                              "Unfreeze some parameters or add prompts.")
         self.optimizer = torch.optim.AdamW(trainable_params, lr=lr)
 
+    @torch.no_grad()
+    def warmup_bank(self, x_warmup, batch_size):
+        device = next(self.model.parameters()).device
+        self.swapper.mode = 'passthrough'
+        self.collector.reset()
+        for i in range(0, min(x_warmup.shape[0], self.bank_size * batch_size), batch_size):
+            end = min(i + batch_size, x_warmup.shape[0])
+            x_batch = x_warmup[i:end].to(device)
+            _ = self.model(x_batch)
+            mu, sigma = self.collector.compute_stats()
+            self.collector.reset()
+            self.update_bank(mu.to(device), sigma.to(device))
+
     def update_bank(self, mu, sigma):
         if len(self.bank_mu) >= self.bank_size:
             self.bank_mu.pop(0)
@@ -138,6 +151,9 @@ def run_consistency_experiment(args):
         print(f" beta = {beta} | layer = block[{args.hook_layer}] |"
               f" blend = {args.alpha_blend} | bank = {args.bank_size} |"
               f" steps = {args.inner_steps}")
+        if args.cross_domain:
+            print(f" cross-domain: bank warmed on {args.corruption_b}, "
+                  f"adapting on {args.corruption_a}")
         print(f"{'='*60}")
 
         tta = ConsistencyTTA(
@@ -145,6 +161,9 @@ def run_consistency_experiment(args):
             alpha_blend=args.alpha_blend, bank_size=args.bank_size,
             lr=args.lr, cls_only=not args.all_tokens,
         )
+
+        if args.cross_domain:
+            tta.warmup_bank(x_b, args.batch_size)
 
         bs = args.batch_size
         n_samples = x_a.shape[0]
@@ -211,5 +230,7 @@ if __name__ == '__main__':
                         choices=['torchvision', 'timm'])
     parser.add_argument('--pretrained', action='store_true', default=True)
     parser.add_argument('--no_pretrained', action='store_false', dest='pretrained')
+    parser.add_argument('--cross_domain', action='store_true',
+                        help='Warm bank with env B, adapt on env A (cross-domain)')
     args = parser.parse_args()
     run_consistency_experiment(args)
