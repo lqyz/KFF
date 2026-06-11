@@ -143,6 +143,8 @@ class OursConsistency(Ours):
 
 def setup_ours_consistency(model):
     from conf import cfg
+    import ours
+    ours._dataset_name = cfg.CORRUPTION.DATASET
     model = configure_model(model, cfg)
     domain_prompts, class_prompts = collect_params(model)
     from main import setup_optimizer
