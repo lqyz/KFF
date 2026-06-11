@@ -25,7 +25,13 @@ def evaluate(description):
         logger.info(f"loading checkpoint from {cfg.TEST.ckpt}")
         base_model = torch.nn.DataParallel(base_model)
         checkpoint = torch.load(cfg.TEST.ckpt)
-        base_model.load_state_dict(checkpoint['model'], strict=False)
+        if 'state_dict' in checkpoint:
+            state_dict = checkpoint['state_dict']
+        elif 'model' in checkpoint:
+            state_dict = checkpoint['model']
+        else:
+            state_dict = checkpoint
+        base_model.load_state_dict(state_dict, strict=False)
         # if you do not use DataParallel, if you want to use DataParallel, simple comment the line below
         base_model = base_model.module if isinstance(base_model, torch.nn.DataParallel) else base_model
         del checkpoint
