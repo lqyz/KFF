@@ -147,7 +147,7 @@ def run_experiment(args):
     print(f" Env A: {args.corruption_a}  |  Bank: {args.corruption_b}")
     print(f" Extract: block[{args.extract_layer}] (clean domain stats)")
     print(f" Inject:  block[{args.swap_layer}] (close to head, KL signal)")
-    print(f" beta={args.beta} | blend={args.blend} | bank={args.bank_size}")
+    print(f" beta sweep | blend={args.blend} | bank={args.bank_size}")
     print(f"{'='*70}")
 
     for beta in args.betas:
