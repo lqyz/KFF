@@ -66,6 +66,12 @@ class OursConsistency(Ours):
         self.swapper_handle = blocks[self.c_layer_idx].register_forward_hook(
             self.swapper)
 
+        if not hasattr(self, 'train_info') or self.train_info is None:
+            vit_base = model.vit.module if isinstance(model.vit, nn.DataParallel) else model.vit
+            D = vit_base.embed_dim
+            self.train_info = (torch.ones(D), torch.zeros(D))
+            logger.warning(f"No source stats, using default train_info (zero-mean unit-var)")
+
         logger.info(f"Consistency TTA: layer=block[{self.c_layer_idx}], "
                     f"beta={self.c_beta}, bank_size={self.c_bank_size}")
 
@@ -154,7 +160,10 @@ def setup_ours_consistency(model):
         tau=cfg.OPTIM.TAU, ema_alpha=cfg.OPTIM.EMA_ALPHA,
         E_OOD=cfg.OPTIM.STEPS,
     )
-    model.obtain_src_stat(data_path=cfg.SRC_DATA_DIR,
-                          num_samples=cfg.SRC_NUM_SAMPLES,
-                          train_info=cfg.OURS.TRAIN_INFO)
+    try:
+        model.obtain_src_stat(data_path=cfg.SRC_DATA_DIR,
+                              num_samples=cfg.SRC_NUM_SAMPLES,
+                              train_info=cfg.OURS.TRAIN_INFO)
+    except Exception as e:
+        logger.warning(f"obtain_src_stat failed ({e}), using default")
     return model
