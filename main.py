@@ -33,6 +33,9 @@ def evaluate(description):
 
     if cfg.MODEL.ADAPTATION == "ours":
         model = setup_ours(base_model)
+    elif cfg.MODEL.ADAPTATION == "ours_c":
+        from ours_c import setup_ours_consistency
+        model = setup_ours_consistency(base_model)
     logger.info(f"test-time adaptation: {cfg.MODEL.ADAPTATION}")
     # evaluate on each severity and type of corruption in turn
     All_error = []

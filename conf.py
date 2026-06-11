@@ -135,6 +135,11 @@ _C.OURS.ALPHA_C = 0.1
 
 _C.OURS.TRAIN_INFO = None
 
+# consistency regularization (ours_c)
+_C.OURS.CONSISTENCY_BETA = 0.0  # 0 = disabled
+_C.OURS.CONSISTENCY_LAYER = 1   # which ViT block to hook
+_C.OURS.CONSISTENCY_BANK = 20   # bank size
+
 # # Config destination (in SAVE_DIR)
 # _C.CFG_DEST = "cfg.yaml"
 
@@ -192,6 +197,13 @@ def load_cfg_fom_args(description="Config options."):
     parser.add_argument("--train_info", default=None, type=str,
                         help="the path of the train info of source data")
 
+    parser.add_argument("--consistency_beta", default=-1, type=float,
+                        help="consistency loss weight (ours_c)")
+    parser.add_argument("--consistency_layer", default=-1, type=int,
+                        help="which ViT block to hook for swap")
+    parser.add_argument("--consistency_bank", default=-1, type=int,
+                        help="memory bank size")
+
     
     if len(sys.argv) == 1:
         parser.print_help()
@@ -223,6 +235,13 @@ def load_cfg_fom_args(description="Config options."):
         
     if args.train_info is not None:
         cfg.OURS.TRAIN_INFO = args.train_info
+
+    if args.consistency_beta >= 0:
+        cfg.OURS.CONSISTENCY_BETA = args.consistency_beta
+    if args.consistency_layer >= 0:
+        cfg.OURS.CONSISTENCY_LAYER = args.consistency_layer
+    if args.consistency_bank > 0:
+        cfg.OURS.CONSISTENCY_BANK = args.consistency_bank
 
     cfg.DATA_DIR = args.data_dir
     cfg.SRC_DATA_DIR = args.src_data_dir
