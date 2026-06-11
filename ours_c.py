@@ -141,7 +141,8 @@ class OursConsistency(Ours):
         self.bank_sigma = []
 
 
-def setup_ours_consistency(model, cfg):
+def setup_ours_consistency(model):
+    from conf import cfg
     model = configure_model(model, cfg)
     domain_prompts, class_prompts = collect_params(model)
     from main import setup_optimizer
