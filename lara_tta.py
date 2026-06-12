@@ -215,7 +215,7 @@ def warmup_bank(model, block, x_warmup, batch_size, device, bank, cls_only=True)
     print(f"    Bank: {len(bank)} environments")
 
 
-def configure_lara(model, hook_layer_idx, freeze_below=True):
+def configure_lara(model, hook_layer_idx, aux_layer_idx, device, freeze_below=True):
     blocks = []
     if hasattr(model, 'blocks'):
         blocks = model.blocks
@@ -238,7 +238,27 @@ def configure_lara(model, hook_layer_idx, freeze_below=True):
                     trainable_params.extend([m.weight, m.bias])
 
     hook_layer = blocks[hook_layer_idx]
-    return trainable_params, hook_layer
+    aux_layer = blocks[min(aux_layer_idx, n - 1)]
+
+    dim = 768
+    try:
+        dim = (model.heads.head if hasattr(model, 'heads') else model.head).in_features
+    except:
+        pass
+    num_classes = 1000 if not hasattr(model, 'heads') else (
+        model.heads.head.out_features if hasattr(model.heads, 'head') else 1000)
+    try:
+        if hasattr(model, 'heads') and hasattr(model.heads, 'head'):
+            num_classes = model.heads.head.out_features
+        elif hasattr(model, 'head'):
+            num_classes = model.head.out_features
+    except:
+        pass
+
+    aux_head = nn.Linear(dim, num_classes).to(device)
+    trainable_params.extend([aux_head.weight, aux_head.bias])
+
+    return trainable_params, hook_layer, aux_layer, aux_head
 
 
 def softmax_entropy(x):
@@ -252,8 +272,10 @@ def run_lara(args):
     model = build_model(args, device)
     x_a, y_a, x_b, y_b = load_data(args)
 
-    trainable_params, hook_layer = configure_lara(model, args.hook_layer)
-    print(f"[*] Trainable params: {len(trainable_params)} (block[{args.hook_layer}-11] LN)")
+    trainable_params, hook_layer, aux_layer, aux_head = configure_lara(
+        model, args.hook_layer, args.aux_layer, device)
+    print(f"[*] Trainable: {len(trainable_params)} params "
+          f"(LN block[{args.hook_layer}-11] + aux_head@{args.aux_layer})")
 
     bank = MemoryBank(max_size=args.bank_size, thr_dist=args.thr_d)
     cls_only = not args.all_tokens
@@ -262,13 +284,19 @@ def run_lara(args):
     swapper = FeatureSwapper(cls_only=cls_only)
     swapper_handle = hook_layer.register_forward_hook(swapper)
 
+    aux_cls = []
+    def aux_hook(module, input, output):
+        aux_cls.append(output[:, 0])
+        return output
+    aux_handle = aux_layer.register_forward_hook(aux_hook)
+
     optimizer = torch.optim.AdamW(trainable_params, lr=args.lr)
 
     bs = args.batch_size
     n = x_a.shape[0]
     correct = 0
-    total_cons = 0.0
     total_base = 0.0
+    total_cons = 0.0
     steps = 0
 
     for i in range(0, n, bs):
@@ -279,10 +307,16 @@ def run_lara(args):
             optimizer.zero_grad()
 
             swapper.mode = 'passthrough'
+            aux_cls.clear()
             logits_orig = model(x_batch)
+            cls_aux_orig = aux_cls.pop() if aux_cls else None
+            logits_aux_orig = aux_head(cls_aux_orig) if cls_aux_orig is not None else None
+
             p_orig = F.softmax(logits_orig, dim=-1)
             h_orig = softmax_entropy(logits_orig)
             loss_base = h_orig.mean()
+            if logits_aux_orig is not None:
+                loss_base += 0.5 * softmax_entropy(logits_aux_orig).mean()
             total_base += loss_base.item()
 
             loss_cons = torch.tensor(0.0, device=device)
@@ -291,7 +325,10 @@ def run_lara(args):
             if hist_mu is not None and args.beta > 0:
                 swapper.mode = 'swap'
                 swapper.set_target(hist_mu.to(device), hist_sigma.to(device))
+                aux_cls.clear()
                 logits_swap = model(x_batch)
+                cls_aux_swap = aux_cls.pop() if aux_cls else None
+                logits_aux_swap = aux_head(cls_aux_swap) if cls_aux_swap is not None else None
 
                 p_swap = F.softmax(logits_swap, dim=-1)
                 h_swap = softmax_entropy(logits_swap)
@@ -302,6 +339,11 @@ def run_lara(args):
                     log_p_swap = F.log_softmax(logits_swap, dim=-1)
                     loss_cons = w_affinity * F.kl_div(
                         log_p_swap, p_orig.detach(), reduction='batchmean')
+                    if logits_aux_swap is not None:
+                        log_p_aux_swap = F.log_softmax(logits_aux_swap, dim=-1)
+                        p_aux_orig = F.softmax(logits_aux_orig.detach(), dim=-1)
+                        loss_cons += w_affinity * F.kl_div(
+                            log_p_aux_swap, p_aux_orig, reduction='batchmean')
                     total_cons += loss_cons.item()
 
                 swapper.mode = 'passthrough'
@@ -322,12 +364,14 @@ def run_lara(args):
             bank.update(mu, sigma)
 
     swapper_handle.remove()
+    aux_handle.remove()
     acc = correct / n
     print(f"\n{'='*60}")
-    print(f" LARA-TTA Results")
-    print(f" Hook: block[{args.hook_layer}] | beta={args.beta} | lr={args.lr}")
-    print(f" Accuracy: {acc:.2%} | base_loss: {total_base/steps:.4f} |"
-          f" cons_loss: {total_cons/steps:.4f} | bank: {len(bank)} entries")
+    print(f" LARA-Aux Results")
+    print(f" Hook: block[{args.hook_layer}] | Aux: block[{args.aux_layer}]")
+    print(f" beta={args.beta} | lr={args.lr}")
+    print(f" Accuracy: {acc:.2%} | base: {total_base/steps:.4f} |"
+          f" cons: {total_cons/steps:.4f} | bank: {len(bank)}")
     print(f"{'='*60}")
 
 
@@ -343,6 +387,8 @@ if __name__ == '__main__':
     parser.add_argument('--n_examples', type=int, default=500)
     parser.add_argument('--batch_size', type=int, default=32)
     parser.add_argument('--hook_layer', type=int, default=5)
+    parser.add_argument('--aux_layer', type=int, default=9,
+                        help='Auxiliary classifier layer (for short gradient path)')
     parser.add_argument('--beta', type=float, default=10.0)
     parser.add_argument('--lr', type=float, default=1e-4)
     parser.add_argument('--inner_steps', type=int, default=3)
