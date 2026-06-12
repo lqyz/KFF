@@ -215,7 +215,8 @@ def warmup_bank(model, block, x_warmup, batch_size, device, bank, cls_only=True)
     print(f"    Bank: {len(bank)} environments")
 
 
-def configure_lara(model, hook_layer_idx, aux_layer_idx, device, freeze_below=True):
+def configure_lara(model, hook_layer_idx, aux_layer_idx, device,
+                   freeze_below=True, train_head=False):
     blocks = []
     if hasattr(model, 'blocks'):
         blocks = model.blocks
@@ -241,12 +242,11 @@ def configure_lara(model, hook_layer_idx, aux_layer_idx, device, freeze_below=Tr
     aux_layer = blocks[min(aux_layer_idx, n - 1)]
 
     dim = 768
+    num_classes = 1000
     try:
         dim = (model.heads.head if hasattr(model, 'heads') else model.head).in_features
     except:
         pass
-    num_classes = 1000 if not hasattr(model, 'heads') else (
-        model.heads.head.out_features if hasattr(model.heads, 'head') else 1000)
     try:
         if hasattr(model, 'heads') and hasattr(model.heads, 'head'):
             num_classes = model.heads.head.out_features
@@ -257,6 +257,21 @@ def configure_lara(model, hook_layer_idx, aux_layer_idx, device, freeze_below=Tr
 
     aux_head = nn.Linear(dim, num_classes).to(device)
     trainable_params.extend([aux_head.weight, aux_head.bias])
+
+    ln_count = len(trainable_params) - 2
+    if train_head:
+        head = None
+        for _, m in model.named_modules():
+            if hasattr(m, 'head'):
+                head = m.head; break
+        if head is None:
+            for _, m in model.named_modules():
+                if hasattr(m, 'heads'):
+                    head = m.heads.head; break
+        if head is not None:
+            for p in head.parameters():
+                p.requires_grad = True
+                trainable_params.append(p)
 
     return trainable_params, hook_layer, aux_layer, aux_head
 
@@ -273,9 +288,12 @@ def run_lara(args):
     x_a, y_a, x_b, y_b = load_data(args)
 
     trainable_params, hook_layer, aux_layer, aux_head = configure_lara(
-        model, args.hook_layer, args.aux_layer, device)
+        model, args.hook_layer, args.aux_layer, device,
+        train_head=args.train_head)
+    head_count = sum(1 for p in trainable_params if p.dim() > 0) - len(
+        [p for p in trainable_params[-2:] if p is aux_head.weight or p is aux_head.bias])
     print(f"[*] Trainable: {len(trainable_params)} params "
-          f"(LN block[{args.hook_layer}-11] + aux_head@{args.aux_layer})")
+          f"(LN block[{args.hook_layer}-11]{' + head' if args.train_head else ''} + aux_head)")
 
     bank = MemoryBank(max_size=args.bank_size, thr_dist=args.thr_d)
     cls_only = not args.all_tokens
@@ -399,5 +417,7 @@ if __name__ == '__main__':
                         choices=['torchvision', 'timm'])
     parser.add_argument('--pretrained', action='store_true', default=True)
     parser.add_argument('--no_pretrained', action='store_false', dest='pretrained')
+    parser.add_argument('--train_head', action='store_true',
+                        help='Jointly train LN + classification head')
     args = parser.parse_args()
     run_lara(args)
