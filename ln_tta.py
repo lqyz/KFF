@@ -19,7 +19,6 @@ class LNSubsetTTA(nn.Module):
 
         self.optimizer = optim.AdamW(self.trainable_params, lr=cfg.OPTIM.LR)
         self.model_state = deepcopy(model.state_dict())
-        self.optimizer_state = deepcopy(self.optimizer.state_dict())
 
     def _setup(self):
         for param in self.model.parameters():
@@ -48,6 +47,9 @@ class LNSubsetTTA(nn.Module):
 
     @torch.enable_grad()
     def forward(self, x):
+        self.model.load_state_dict(self.model_state)
+        self.optimizer = optim.AdamW(self.trainable_params, lr=self.cfg.OPTIM.LR)
+
         steps = self.cfg.OPTIM.STEPS
         self.model.train()
 
@@ -63,9 +65,8 @@ class LNSubsetTTA(nn.Module):
             return self.model(x)
 
     def reset(self):
-        self.model.load_state_dict(self.model_state)
-        self.optimizer.load_state_dict(self.optimizer_state)
-        logger.info("LNSubsetTTA: reset to initial state")
+        logger.info("LNSubsetTTA: reset")
+        pass
 
 
 def setup_ln_subset(model):
