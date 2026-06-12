@@ -42,6 +42,13 @@ def evaluate(description):
     elif cfg.MODEL.ADAPTATION == "ours_c":
         from ours_c import setup_ours_consistency
         model = setup_ours_consistency(base_model)
+    elif cfg.MODEL.ADAPTATION == "ln_subset":
+        from ln_tta import setup_ln_subset
+        model = setup_ln_subset(base_model)
+    elif cfg.MODEL.ADAPTATION == "source":
+        pass  # no adaptation
+    else:
+        raise ValueError(f"Unknown adaptation: {cfg.MODEL.ADAPTATION}")
     logger.info(f"test-time adaptation: {cfg.MODEL.ADAPTATION}")
     # evaluate on each severity and type of corruption in turn
     All_error = []
