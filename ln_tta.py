@@ -102,14 +102,21 @@ class LNSubsetTTA(nn.Module):
             steps = self.cfg.OPTIM.STEPS
             self.model.train()
 
-            for s in range(steps):
-                temp = 2.0 - 1.0 * (s / max(steps - 1, 1))
-                self.optimizer.zero_grad()
-                out = self.model(x)
-                logits = out / temp
-                loss = -(logits.softmax(1) * logits.log_softmax(1)).sum(1).mean()
-                loss.backward()
-                self.optimizer.step()
+            # Decouple adaptation from inference batch:
+            # use sub-batches of size 16 for more stable gradient estimates
+            bs = min(16, x.shape[0])
+            sub_steps = max(1, steps // 2)
+
+            for _ in range(sub_steps):
+                perm = torch.randperm(x.shape[0], device=x.device)
+                for j in range(0, x.shape[0], bs):
+                    end = min(j + bs, x.shape[0])
+                    xb = x[perm[j:end]]
+                    self.optimizer.zero_grad()
+                    out = self.model(xb)
+                    loss = -(out.softmax(1) * out.log_softmax(1)).sum(1).mean()
+                    loss.backward()
+                    self.optimizer.step()
 
             self.adapted = True
 
