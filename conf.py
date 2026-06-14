@@ -140,6 +140,11 @@ _C.OURS.CONSISTENCY_BETA = 0.0  # 0 = disabled
 _C.OURS.CONSISTENCY_LAYER = 1   # which ViT block to hook
 _C.OURS.CONSISTENCY_BANK = 20   # bank size
 
+# LN subset expansion
+_C.OURS.TRAIN_QKV = False
+_C.OURS.TRAIN_PROJ = False
+_C.OURS.TRAIN_MLP = False
+
 # # Config destination (in SAVE_DIR)
 # _C.CFG_DEST = "cfg.yaml"
 
@@ -204,6 +209,13 @@ def load_cfg_fom_args(description="Config options."):
     parser.add_argument("--consistency_bank", default=-1, type=int,
                         help="memory bank size")
 
+    parser.add_argument("--train_qkv", action='store_true',
+                        help="also train attention qkv in LN subset layers")
+    parser.add_argument("--train_proj", action='store_true',
+                        help="also train attention proj in LN subset layers")
+    parser.add_argument("--train_mlp", action='store_true',
+                        help="also train MLP in LN subset layers")
+
     
     if len(sys.argv) == 1:
         parser.print_help()
@@ -242,6 +254,13 @@ def load_cfg_fom_args(description="Config options."):
         cfg.OURS.CONSISTENCY_LAYER = args.consistency_layer
     if args.consistency_bank > 0:
         cfg.OURS.CONSISTENCY_BANK = args.consistency_bank
+
+    if args.train_qkv:
+        cfg.OURS.TRAIN_QKV = True
+    if args.train_proj:
+        cfg.OURS.TRAIN_PROJ = True
+    if args.train_mlp:
+        cfg.OURS.TRAIN_MLP = True
 
     cfg.DATA_DIR = args.data_dir
     cfg.SRC_DATA_DIR = args.src_data_dir

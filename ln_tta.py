@@ -6,7 +6,6 @@ from copy import deepcopy
 import torch
 import torch.nn as nn
 import torch.optim as optim
-import torch.nn.functional as F
 
 
 class LNSubsetTTA(nn.Module):
@@ -14,11 +13,10 @@ class LNSubsetTTA(nn.Module):
         super().__init__()
         self.model = model
         self.cfg = cfg
+        self.adapted = False
         self.param_groups = []
-        self._setup()
-
-        self.optimizer = self._build_optimizer()
         self.model_state = deepcopy(model.state_dict())
+        self._setup()
 
     def _lr_for_block(self, i, total, base_lr):
         frac = (i - 5) / (total - 5)
@@ -38,53 +36,91 @@ class LNSubsetTTA(nn.Module):
         n = len(blocks)
         hook_idx = min(5, n - 1)
         base_lr = self.cfg.OPTIM.LR
-        total_trainable = 0
+        total_params = 0
+        modes = []
 
-        logger.info(f"LNSubsetTTA: training LN in blocks[{hook_idx}..{n-1}]")
+        if getattr(self.cfg.OURS, 'TRAIN_QKV', False):
+            modes.append('qkv')
+        if getattr(self.cfg.OURS, 'TRAIN_PROJ', False):
+            modes.append('proj')
+        if getattr(self.cfg.OURS, 'TRAIN_MLP', False):
+            modes.append('mlp')
+        modes.append('ln')
+
+        logger.info(f"LNSubsetTTA: training blocks[{hook_idx}..{n-1}] mode={modes}")
 
         for i in range(hook_idx, n):
+            block = blocks[i]
             block_params = []
-            for m in blocks[i].modules():
+
+            for m in block.modules():
                 if isinstance(m, torch.nn.LayerNorm):
                     m.weight.requires_grad = True
                     m.bias.requires_grad = True
                     block_params.extend([m.weight, m.bias])
+
+            if 'qkv' in modes:
+                try:
+                    qkv = block.attn.qkv
+                    qkv.weight.requires_grad = True
+                    if qkv.bias is not None:
+                        qkv.bias.requires_grad = True
+                    block_params.extend([qkv.weight, qkv.bias] if qkv.bias is not None else [qkv.weight])
+                except AttributeError:
+                    pass
+
+            if 'proj' in modes:
+                try:
+                    proj = block.attn.proj
+                    proj.weight.requires_grad = True
+                    if proj.bias is not None:
+                        proj.bias.requires_grad = True
+                    block_params.extend([proj.weight, proj.bias] if proj.bias is not None else [proj.weight])
+                except AttributeError:
+                    pass
+
+            if 'mlp' in modes:
+                try:
+                    for name, param in block.mlp.named_parameters():
+                        param.requires_grad = True
+                        block_params.append(param)
+                except AttributeError:
+                    pass
+
             if block_params:
                 lr = self._lr_for_block(i, n, base_lr)
                 self.param_groups.append({'params': block_params, 'lr': lr})
-                total_trainable += len(block_params)
-                logger.info(f"  block[{i}]: {len(block_params)} params, lr={lr:.2e}")
+                total_params += sum(p.numel() for p in block_params)
+                logger.info(f"  block[{i}]: {sum(p.numel() for p in block_params):,} params, lr={lr:.2e}")
 
-        logger.info(f"LNSubsetTTA: {total_trainable} LN parameters "
-                    f"({sum(p.numel() for g in self.param_groups for p in g['params']):,} values)")
-
-    def _build_optimizer(self):
-        return optim.AdamW(self.param_groups, weight_decay=0.0)
+        logger.info(f"LNSubsetTTA: {total_params:,} trainable values")
 
     @torch.enable_grad()
     def forward(self, x):
-        self.model.load_state_dict(self.model_state)
-        self.optimizer = self._build_optimizer()
+        if not self.adapted:
+            self.optimizer = optim.AdamW(self.param_groups, weight_decay=0.0)
+            steps = self.cfg.OPTIM.STEPS
+            self.model.train()
 
-        steps = self.cfg.OPTIM.STEPS
-        self.model.train()
+            for s in range(steps):
+                temp = 2.0 - 1.0 * (s / max(steps - 1, 1))
+                self.optimizer.zero_grad()
+                out = self.model(x)
+                logits = out / temp
+                loss = -(logits.softmax(1) * logits.log_softmax(1)).sum(1).mean()
+                loss.backward()
+                self.optimizer.step()
 
-        for s in range(steps):
-            temp = 2.0 - 1.0 * (s / max(steps - 1, 1))
-            self.optimizer.zero_grad()
-            out = self.model(x)
-            logits = out / temp
-            loss = -(logits.softmax(1) * logits.log_softmax(1)).sum(1).mean()
-            loss.backward()
-            self.optimizer.step()
+            self.adapted = True
 
         self.model.eval()
         with torch.no_grad():
             return self.model(x)
 
     def reset(self):
+        self.model.load_state_dict(self.model_state)
+        self.adapted = False
         logger.info("LNSubsetTTA: reset")
-        pass
 
 
 def setup_ln_subset(model):
