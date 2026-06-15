@@ -144,6 +144,10 @@ _C.OURS.CONSISTENCY_BANK = 20   # bank size
 _C.OURS.TRAIN_QKV = False
 _C.OURS.TRAIN_PROJ = False
 _C.OURS.TRAIN_MLP = False
+_C.OURS.TRAIN_GSNR = False
+_C.OURS.GSNR_K = 4
+_C.OURS.GSNR_THR = 0.4
+_C.OURS.GSNR_TAU = 0.1
 
 # # Config destination (in SAVE_DIR)
 # _C.CFG_DEST = "cfg.yaml"
@@ -215,6 +219,14 @@ def load_cfg_fom_args(description="Config options."):
                         help="also train attention proj in LN subset layers")
     parser.add_argument("--train_mlp", action='store_true',
                         help="also train MLP in LN subset layers")
+    parser.add_argument("--train_gsnr", action='store_true',
+                        help="enable GSNR gating for LN subset")
+    parser.add_argument("--gsnr_k", type=int, default=4,
+                        help="number of sub-batches for GSNR estimation")
+    parser.add_argument("--gsnr_thr", type=float, default=0.4,
+                        help="GSNR threshold for gate")
+    parser.add_argument("--gsnr_tau", type=float, default=0.1,
+                        help="GSNR gate temperature")
 
     
     if len(sys.argv) == 1:
@@ -261,6 +273,14 @@ def load_cfg_fom_args(description="Config options."):
         cfg.OURS.TRAIN_PROJ = True
     if args.train_mlp:
         cfg.OURS.TRAIN_MLP = True
+    if args.train_gsnr:
+        cfg.OURS.TRAIN_GSNR = True
+    if args.gsnr_k != 4:
+        cfg.OURS.GSNR_K = args.gsnr_k
+    if args.gsnr_thr != 0.4:
+        cfg.OURS.GSNR_THR = args.gsnr_thr
+    if args.gsnr_tau != 0.1:
+        cfg.OURS.GSNR_TAU = args.gsnr_tau
 
     cfg.DATA_DIR = args.data_dir
     cfg.SRC_DATA_DIR = args.src_data_dir
