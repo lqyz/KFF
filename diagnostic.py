@@ -44,6 +44,8 @@ def collect_attention_entropy(model, x, layer_idx):
 
 
 def diagnostic_run(args):
+    import torchvision.transforms as transforms
+    from PIL import Image
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"[*] Diagnostic: TSS curves for clean vs corrupted domains")
 
@@ -57,35 +59,30 @@ def diagnostic_run(args):
     # Load data
     pairs = [
         ('clean', None),
-        ('gaussian_noise', None),
-        ('defocus_blur', None),
-        ('contrast', None),
-        ('brightness', None),
-        ('fog', None),
-        ('snow', None),
+        ('gaussian_noise', 'gaussian_noise'),
+        ('defocus_blur', 'defocus_blur'),
+        ('contrast', 'contrast'),
+        ('brightness', 'brightness'),
+        ('fog', 'fog'),
+        ('snow', 'snow'),
     ]
 
     results = {}
+    c_data = args.corruption_data_dir
 
     for label, corr in pairs:
-        if corr is None and label == 'clean':
+        if corr:
+            x_all, _ = load_imagenetc(min(args.n_examples, 200), args.severity,
+                                      c_data, corruptions=[corr])
+            x_all = (x_all - mean) / std
+        else:  # clean
             path = Path(args.data_dir) / 'val' / 'images'
-            from torchvision import transforms
-            from PIL import Image
             imgs = sorted(Path(path).glob('*.JPEG'))[:min(args.n_examples, 200)]
             T = transforms.Compose([
                 transforms.Resize(256), transforms.CenterCrop(224),
                 transforms.ToTensor()])
-            x_list = []
-            for p in imgs:
-                x_list.append(T(Image.open(p).convert('RGB')))
+            x_list = [T(Image.open(p).convert('RGB')) for p in imgs]
             x_all = torch.stack(x_list)
-            x_all = (x_all - mean) / std
-        else:
-            if corr is None:
-                continue
-            x_all, _ = load_imagenetc(args.n_examples, args.severity,
-                                      args.data_dir, corruptions=[corr])
             x_all = (x_all - mean) / std
 
         bs = args.batch_size
@@ -169,8 +166,11 @@ def diagnostic_run(args):
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='TSS/AME Diagnostic')
     parser.add_argument('--data_dir', type=str,
+                        default='/root/data/imagenet',
+                        help='ImageNet root (for clean val images)')
+    parser.add_argument('--corruption_data_dir', type=str,
                         default='/root/data/picture/ImageNet-C',
-                        help='ImageNet or ImageNet-C root')
+                        help='ImageNet-C root (for corrupted images)')
     parser.add_argument('--n_examples', type=int, default=200)
     parser.add_argument('--severity', type=int, default=5)
     parser.add_argument('--batch_size', type=int, default=64)
