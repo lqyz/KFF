@@ -39,6 +39,7 @@ class LNSubsetTTA(nn.Module):
         base_lr = self.cfg.OPTIM.LR
         total_params = 0
         modes = []
+        self.bottlenecks = nn.ModuleList()
 
         if getattr(self.cfg.OURS, 'TRAIN_QKV', False):
             modes.append('qkv')
@@ -46,6 +47,8 @@ class LNSubsetTTA(nn.Module):
             modes.append('proj')
         if getattr(self.cfg.OURS, 'TRAIN_MLP', False):
             modes.append('mlp')
+        if getattr(self.cfg.OURS, 'TRAIN_BN', False):
+            modes.append('bottleneck')
         modes.append('ln')
 
         use_gsnr = getattr(self.cfg.OURS, 'TRAIN_GSNR', False)
@@ -97,6 +100,19 @@ class LNSubsetTTA(nn.Module):
                     pass
 
             if block_params:
+                if 'bottleneck' in modes:
+                    bn = nn.Sequential(
+                        nn.Linear(768, 32, bias=False),
+                        nn.Linear(32, 768, bias=False),
+                    )
+                    nn.init.zeros_(bn[1].weight)
+                    bn[0].weight.requires_grad = True
+                    bn[1].weight.requires_grad = True
+                    block_params.extend([bn[0].weight, bn[1].weight])
+                    self.bottlenecks.append(bn)
+                else:
+                    self.bottlenecks.append(None)
+
                 lr = self._lr_for_block(i, n, base_lr)
                 self.param_groups.append({'params': block_params, 'lr': lr,
                                           'block_idx': i})
@@ -263,6 +279,26 @@ class LNSubsetTTA(nn.Module):
             self.optimizer = optim.AdamW(self.param_groups, weight_decay=0.0)
             self.model.train()
 
+            use_bn = getattr(self.cfg.OURS, 'TRAIN_BN', False)
+            bn_handles = []
+            if use_bn:
+                blocks = (self.model.blocks if hasattr(self.model, 'blocks')
+                          else self.model.encoder.layers)
+                for gi, group in enumerate(self.param_groups):
+                    bi = group['block_idx']
+                    bn = self.bottlenecks[gi]
+                    if bn is not None:
+                        def make_hook(bn_module):
+                            def hook(module, input, output):
+                                cls = output[:, 0]
+                                cls_out = cls + bn_module(cls)
+                                out = output.clone()
+                                out[:, 0] = cls_out
+                                return out
+                            return hook
+                        bn_handles.append(blocks[bi].register_forward_hook(
+                            make_hook(bn)))
+
             steps = self.cfg.OPTIM.STEPS
             use_gsnr = getattr(self.cfg.OURS, 'TRAIN_GSNR', False)
             use_hda = getattr(self.cfg.OURS, 'TRAIN_HDA', False)
@@ -284,6 +320,9 @@ class LNSubsetTTA(nn.Module):
                 self._accum_adapt(x, max(1, steps // 2))
             else:
                 self._standard_adapt(x, max(1, steps // 2))
+
+            for h in bn_handles:
+                h.remove()
 
             self.adapted = True
 

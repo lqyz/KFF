@@ -153,6 +153,7 @@ _C.OURS.HDA_TAU = 2.0
 _C.OURS.TRAIN_ACCUM = False
 _C.OURS.ACCUM_K = 4
 _C.OURS.ADAPTIVE_STEPS = False
+_C.OURS.TRAIN_BN = False
 
 # # Config destination (in SAVE_DIR)
 # _C.CFG_DEST = "cfg.yaml"
@@ -242,6 +243,8 @@ def load_cfg_fom_args(description="Config options."):
                         help="number of sub-batches to accumulate per step")
     parser.add_argument("--adaptive_steps", action='store_true',
                         help="auto-scale STEPS based on domain alignment")
+    parser.add_argument("--train_bn", action='store_true',
+                        help="add bottleneck adapter (768->32->768) per block")
 
     
     if len(sys.argv) == 1:
@@ -306,6 +309,8 @@ def load_cfg_fom_args(description="Config options."):
         cfg.OURS.ACCUM_K = args.accum_k
     if args.adaptive_steps:
         cfg.OURS.ADAPTIVE_STEPS = True
+    if args.train_bn:
+        cfg.OURS.TRAIN_BN = True
 
     cfg.DATA_DIR = args.data_dir
     cfg.SRC_DATA_DIR = args.src_data_dir
