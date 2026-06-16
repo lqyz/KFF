@@ -105,6 +105,22 @@ class LNSubsetTTA(nn.Module):
 
         logger.info(f"LNSubsetTTA: {total_params:,} trainable values")
 
+    def _accum_adapt(self, x, steps):
+        """Multi-batch gradient accumulation: pool gradients from K sub-batches
+        before each step. Prevents overfitting to a single sub-batch."""
+        bs = 16
+        K = getattr(self.cfg.OURS, 'ACCUM_K', 4)
+        for _ in range(steps):
+            perm = torch.randperm(x.shape[0], device=x.device)
+            self.optimizer.zero_grad()
+            for j in range(0, min(K * bs, x.shape[0]), bs):
+                end = min(j + bs, x.shape[0])
+                xb = x[perm[j:end]]
+                out = self.model(xb)
+                loss = -(out.softmax(1) * out.log_softmax(1)).sum(1).mean() / K
+                loss.backward()
+            self.optimizer.step()
+
     def _standard_adapt(self, x, steps):
         """Standard sub-batch entropy minimization."""
         bs = min(16, x.shape[0])
@@ -250,11 +266,14 @@ class LNSubsetTTA(nn.Module):
             steps = self.cfg.OPTIM.STEPS
             use_gsnr = getattr(self.cfg.OURS, 'TRAIN_GSNR', False)
             use_hda = getattr(self.cfg.OURS, 'TRAIN_HDA', False)
+            use_accum = getattr(self.cfg.OURS, 'TRAIN_ACCUM', False)
 
             if use_hda:
                 self._hda_adapt(x, max(1, steps // 2))
             elif use_gsnr:
                 self._gsnr_adapt(x, max(1, steps // 2))
+            elif use_accum:
+                self._accum_adapt(x, max(1, steps // 2))
             else:
                 self._standard_adapt(x, max(1, steps // 2))
 
