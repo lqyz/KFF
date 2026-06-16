@@ -176,12 +176,17 @@ class LNSubsetTTA(nn.Module):
                 logger.info(f"  GSNR step 0 gates: {gate_str}")
 
     def _hda_adapt(self, x, steps):
-        """Hierarchical Domain Awareness: shallow-block feature variance
-        modulates deep-block learning rates via alignment scores."""
+        """CLS-std HDA: per-block CLS feature std compared to clean baseline
+        tells us how much corruption suppressed semantic structure at each block.
+        Shallow-block alignment gates deep-block adaptation magnitude."""
         blocks = (self.model.blocks if hasattr(self.model, 'blocks')
                   else self.model.encoder.layers)
         probe_idx = [0, 2, 4, 6, 8, 10]
         probe_idx = [i for i in probe_idx if i < self.n_blocks]
+
+        # Clean baseline CLS std from diagnostic (vit_base_patch16_224)
+        clean_std = {0: 0.76, 1: 1.3, 2: 1.95, 3: 2.2, 4: 2.40,
+                     5: 3.2, 6: 3.94, 7: 6.0, 8: 8.43, 9: 15.0, 10: 24.69, 11: 35.0}
 
         cls_features = {}
 
@@ -195,7 +200,6 @@ class LNSubsetTTA(nn.Module):
                    for i in probe_idx]
 
         bs = min(16, x.shape[0])
-        hda_temperature = getattr(self.cfg.OURS, 'HDA_TAU', 2.0)
 
         for step in range(steps):
             perm = torch.randperm(x.shape[0], device=x.device)
@@ -211,32 +215,28 @@ class LNSubsetTTA(nn.Module):
 
                 scores = {}
                 if cls_features:
-                    all_std = [cls_features[i].std(dim=0).norm().item()
-                               for i in probe_idx if i in cls_features]
-                    mean_std = sum(all_std) / len(all_std) if all_std else 1.0
                     for i in probe_idx:
                         if i in cls_features:
-                            std_i = cls_features[i].std(dim=0).norm().item()
-                            scores[i] = 1.0 / (1.0 + std_i / (mean_std + 1e-8))
+                            cur_std = cls_features[i].std(dim=0).norm().item()
+                            s = min(1.0, cur_std / (clean_std.get(i, 1.0) + 1e-8))
+                            scores[i] = s
 
                 for g_idx, group in enumerate(self.param_groups):
                     bi = group['block_idx']
-                    shallower_scores = [scores[s] for s in scores
-                                        if s < bi]
-                    weight = (sum(shallower_scores) / len(shallower_scores)
-                              if shallower_scores else 1.0)
-                    if weight < 0.3:
-                        weight = 0.3
+                    shallower = [scores[s] for s in scores if s < bi]
+                    weight = (sum(shallower) / len(shallower)
+                              if shallower else 1.0)
+                    weight = max(0.3, min(weight, 1.0))
                     for p in group['params']:
                         if p.grad is not None:
-                            p.grad *= min(weight, 1.0)
+                            p.grad *= weight
 
                 self.optimizer.step()
 
             if step == 0:
-                score_str = ', '.join(f"b{i}={scores.get(i, 1):.3f}"
-                                      for i in probe_idx)
-                logger.info(f"  HDA step 0 scores: {score_str}")
+                score_str = ', '.join(
+                    f"b{i}={scores.get(i, 1):.3f}" for i in probe_idx)
+                logger.info(f"  HDA-cls step 0: {score_str}")
 
         for h in handles:
             h.remove()
