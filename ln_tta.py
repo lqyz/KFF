@@ -267,6 +267,14 @@ class LNSubsetTTA(nn.Module):
             use_gsnr = getattr(self.cfg.OURS, 'TRAIN_GSNR', False)
             use_hda = getattr(self.cfg.OURS, 'TRAIN_HDA', False)
             use_accum = getattr(self.cfg.OURS, 'TRAIN_ACCUM', False)
+            use_adapt = getattr(self.cfg.OURS, 'ADAPTIVE_STEPS', False)
+
+            if use_adapt:
+                alignment = self._measure_alignment(x)
+                scale = 1.0 / max(alignment, 0.3)
+                steps = max(5, int(steps * scale))
+                logger.info(f"  Adaptive steps: alignment={alignment:.3f}, "
+                            f"scale={scale:.2f}, steps={steps}")
 
             if use_hda:
                 self._hda_adapt(x, max(1, steps // 2))
@@ -282,6 +290,39 @@ class LNSubsetTTA(nn.Module):
         self.model.eval()
         with torch.no_grad():
             return self.model(x)
+
+    @torch.no_grad()
+    def _measure_alignment(self, x):
+        """Measure domain alignment via CLS-std ratio to clean baseline."""
+        blocks = (self.model.blocks if hasattr(self.model, 'blocks')
+                  else self.model.encoder.layers)
+        probe_idx = [2, 4, 6, 8]
+        probe_idx = [i for i in probe_idx if i < len(blocks)]
+        clean_std = {2: 1.95, 4: 2.40, 6: 3.94, 8: 8.43}
+
+        cls_vals = {}
+
+        def make_hook(idx):
+            def hook(module, input, output):
+                cls_vals[idx] = output[:, 0].detach()
+                return output
+            return hook
+
+        handles = [blocks[i].register_forward_hook(make_hook(i))
+                   for i in probe_idx]
+        bs = min(64, x.shape[0])
+        for j in range(0, min(256, x.shape[0]), bs):
+            end = min(j + bs, x.shape[0])
+            _ = self.model(x[j:end])
+        for h in handles:
+            h.remove()
+
+        ratios = []
+        for i in probe_idx:
+            if i in cls_vals and i in clean_std:
+                cur = cls_vals[i].std(dim=0).norm().item()
+                ratios.append(min(1.0, cur / (clean_std[i] + 1e-8)))
+        return sum(ratios) / len(ratios) if ratios else 1.0
 
     def reset(self):
         self.model.load_state_dict(self.model_state)
