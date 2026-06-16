@@ -35,6 +35,7 @@ class LNSubsetTTA(nn.Module):
 
         n = len(blocks)
         self.hook_idx = min(5, n - 1)
+        self.n_blocks = n
         base_lr = self.cfg.OPTIM.LR
         total_params = 0
         modes = []
@@ -48,9 +49,12 @@ class LNSubsetTTA(nn.Module):
         modes.append('ln')
 
         use_gsnr = getattr(self.cfg.OURS, 'TRAIN_GSNR', False)
+        use_hda = getattr(self.cfg.OURS, 'TRAIN_HDA', False)
         mode_str = '+'.join(modes)
         if use_gsnr:
-            mode_str += ' (GSNR gated)'
+            mode_str += ' (GSNR)'
+        if use_hda:
+            mode_str += ' (HDA)'
         logger.info(f"LNSubsetTTA: training blocks[{self.hook_idx}..{n-1}] mode={mode_str}")
 
         self.block_bounds = []
@@ -171,6 +175,72 @@ class LNSubsetTTA(nn.Module):
                                      for gi, g in enumerate(self.param_groups))
                 logger.info(f"  GSNR step 0 gates: {gate_str}")
 
+    def _hda_adapt(self, x, steps):
+        """Hierarchical Domain Awareness: shallow-block feature variance
+        modulates deep-block learning rates via alignment scores."""
+        blocks = (self.model.blocks if hasattr(self.model, 'blocks')
+                  else self.model.encoder.layers)
+        probe_idx = [0, 2, 4, 6, 8, 10]
+        probe_idx = [i for i in probe_idx if i < self.n_blocks]
+
+        cls_features = {}
+
+        def make_hook(idx):
+            def hook(module, input, output):
+                cls_features[idx] = output[:, 0].detach()
+                return output
+            return hook
+
+        handles = [blocks[i].register_forward_hook(make_hook(i))
+                   for i in probe_idx]
+
+        bs = min(16, x.shape[0])
+        hda_temperature = getattr(self.cfg.OURS, 'HDA_TAU', 2.0)
+
+        for step in range(steps):
+            perm = torch.randperm(x.shape[0], device=x.device)
+            for j in range(0, x.shape[0], bs):
+                end = min(j + bs, x.shape[0])
+                xb = x[perm[j:end]]
+
+                self.optimizer.zero_grad()
+                cls_features.clear()
+                out = self.model(xb)
+                loss = -(out.softmax(1) * out.log_softmax(1)).sum(1).mean()
+                loss.backward()
+
+                scores = {}
+                if cls_features:
+                    all_std = [cls_features[i].std(dim=0).norm().item()
+                               for i in probe_idx if i in cls_features]
+                    mean_std = sum(all_std) / len(all_std) if all_std else 1.0
+                    for i in probe_idx:
+                        if i in cls_features:
+                            std_i = cls_features[i].std(dim=0).norm().item()
+                            scores[i] = 1.0 / (1.0 + std_i / (mean_std + 1e-8))
+
+                for g_idx, group in enumerate(self.param_groups):
+                    bi = group['block_idx']
+                    shallower_scores = [scores[s] for s in scores
+                                        if s < bi]
+                    weight = (sum(shallower_scores) / len(shallower_scores)
+                              if shallower_scores else 1.0)
+                    if weight < 0.3:
+                        weight = 0.3
+                    for p in group['params']:
+                        if p.grad is not None:
+                            p.grad *= min(weight, 1.0)
+
+                self.optimizer.step()
+
+            if step == 0:
+                score_str = ', '.join(f"b{i}={scores.get(i, 1):.3f}"
+                                      for i in probe_idx)
+                logger.info(f"  HDA step 0 scores: {score_str}")
+
+        for h in handles:
+            h.remove()
+
     @torch.enable_grad()
     def forward(self, x):
         if not self.adapted:
@@ -179,8 +249,11 @@ class LNSubsetTTA(nn.Module):
 
             steps = self.cfg.OPTIM.STEPS
             use_gsnr = getattr(self.cfg.OURS, 'TRAIN_GSNR', False)
+            use_hda = getattr(self.cfg.OURS, 'TRAIN_HDA', False)
 
-            if use_gsnr:
+            if use_hda:
+                self._hda_adapt(x, max(1, steps // 2))
+            elif use_gsnr:
                 self._gsnr_adapt(x, max(1, steps // 2))
             else:
                 self._standard_adapt(x, max(1, steps // 2))

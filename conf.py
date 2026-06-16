@@ -148,6 +148,8 @@ _C.OURS.TRAIN_GSNR = False
 _C.OURS.GSNR_K = 4
 _C.OURS.GSNR_THR = 0.4
 _C.OURS.GSNR_TAU = 0.1
+_C.OURS.TRAIN_HDA = False
+_C.OURS.HDA_TAU = 2.0
 
 # # Config destination (in SAVE_DIR)
 # _C.CFG_DEST = "cfg.yaml"
@@ -227,6 +229,10 @@ def load_cfg_fom_args(description="Config options."):
                         help="GSNR threshold for gate")
     parser.add_argument("--gsnr_tau", type=float, default=0.1,
                         help="GSNR gate temperature")
+    parser.add_argument("--train_hda", action='store_true',
+                        help="enable hierarchical domain awareness (HDA)")
+    parser.add_argument("--hda_tau", type=float, default=2.0,
+                        help="HDA temperature for alignment score")
 
     
     if len(sys.argv) == 1:
@@ -281,6 +287,10 @@ def load_cfg_fom_args(description="Config options."):
         cfg.OURS.GSNR_THR = args.gsnr_thr
     if args.gsnr_tau != 0.1:
         cfg.OURS.GSNR_TAU = args.gsnr_tau
+    if args.train_hda:
+        cfg.OURS.TRAIN_HDA = True
+    if args.hda_tau != 2.0:
+        cfg.OURS.HDA_TAU = args.hda_tau
 
     cfg.DATA_DIR = args.data_dir
     cfg.SRC_DATA_DIR = args.src_data_dir
